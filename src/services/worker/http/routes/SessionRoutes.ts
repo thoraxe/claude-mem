@@ -147,29 +147,25 @@ export class SessionRoutes extends BaseRouteHandler {
 
         // Mark all processing messages as failed so they can be retried or abandoned
         const pendingStore = this.sessionManager.getPendingMessageStore();
-        const db = this.dbManager.getSessionStore().db;
         try {
-          const stmt = db.prepare(`
-            SELECT id FROM pending_messages
-            WHERE session_db_id = ? AND status = 'processing'
-          `);
-          const processingMessages = stmt.all(session.sessionDbId) as { id: number }[];
-
-          for (const msg of processingMessages) {
-            pendingStore.markFailed(msg.id);
-            logger.warn('SESSION', `Marked message as failed after generator error`, {
+          const failedCount = pendingStore.markSessionMessagesFailed(session.sessionDbId);
+          if (failedCount > 0) {
+            logger.warn('SESSION', `Marked messages as failed after generator error`, {
               sessionId: session.sessionDbId,
-              messageId: msg.id
+              failedCount
             });
           }
         } catch (dbError) {
-          logger.error('SESSION', 'Failed to mark messages as failed', { sessionId: session.sessionDbId }, dbError as Error);
+          logger.error('SESSION', 'Failed to mark messages as failed', {
+            sessionId: session.sessionDbId
+          }, dbError as Error);
         }
       })
       .finally(() => {
         const sessionDbId = session.sessionDbId;
-        
-        if (session.abortController.signal.aborted) {
+        const wasAborted = session.abortController.signal.aborted;
+
+        if (wasAborted) {
           logger.info('SESSION', `Generator aborted`, { sessionId: sessionDbId });
         } else {
           logger.warn('SESSION', `Generator exited unexpectedly`, { sessionId: sessionDbId });
@@ -180,16 +176,20 @@ export class SessionRoutes extends BaseRouteHandler {
         this.workerService.broadcastProcessingStatus();
 
         // Crash recovery: If not aborted and still has work, restart
-        if (!session.abortController.signal.aborted) {
+        if (!wasAborted) {
           try {
             const pendingStore = this.sessionManager.getPendingMessageStore();
             const pendingCount = pendingStore.getPendingCount(sessionDbId);
-            
+
             if (pendingCount > 0) {
               logger.info('SESSION', `Restarting generator after crash/exit with pending work`, {
                 sessionId: sessionDbId,
                 pendingCount
               });
+
+              // Create new AbortController for the restarted generator
+              session.abortController = new AbortController();
+
               // Small delay before restart
               setTimeout(() => {
                 const stillExists = this.sessionManager.getSession(sessionDbId);
@@ -197,12 +197,20 @@ export class SessionRoutes extends BaseRouteHandler {
                   this.startGeneratorWithProvider(stillExists, this.getSelectedProvider(), 'crash-recovery');
                 }
               }, 1000);
+            } else {
+              // No pending work - abort to kill the child process
+              session.abortController.abort();
+              logger.debug('SESSION', 'Aborted controller after natural completion', {
+                sessionId: sessionDbId
+              });
             }
           } catch (e) {
-            // Ignore errors during recovery check
+            // Ignore errors during recovery check, but still abort to prevent leaks
+            logger.debug('SESSION', 'Error during recovery check, aborting to prevent leaks', { sessionId: sessionDbId, error: e instanceof Error ? e.message : String(e) });
+            session.abortController.abort();
           }
         }
-        // NOTE: We do NOT delete the session here anymore. 
+        // NOTE: We do NOT delete the session here anymore.
         // The generator waits for events, so if it exited, it's either aborted or crashed.
         // Idle sessions stay in memory (ActiveSession is small) to listen for future events.
       });
@@ -325,9 +333,9 @@ export class SessionRoutes extends BaseRouteHandler {
     const sessionDbId = this.parseIntParam(req, res, 'sessionDbId');
     if (sessionDbId === null) return;
 
-    const { last_user_message, last_assistant_message } = req.body;
+    const { last_assistant_message } = req.body;
 
-    this.sessionManager.queueSummarize(sessionDbId, last_user_message, last_assistant_message);
+    this.sessionManager.queueSummarize(sessionDbId, last_assistant_message);
 
     // CRITICAL: Ensure SDK agent is running to consume the queue
     this.ensureGeneratorRunning(sessionDbId, 'summarize');
@@ -479,12 +487,12 @@ export class SessionRoutes extends BaseRouteHandler {
   /**
    * Queue summarize by contentSessionId (summary-hook uses this)
    * POST /api/sessions/summarize
-   * Body: { contentSessionId, last_user_message, last_assistant_message }
+   * Body: { contentSessionId, last_assistant_message }
    *
    * Checks privacy, queues summarize request for SDK agent
    */
   private handleSummarizeByClaudeId = this.wrapHandler((req: Request, res: Response): void => {
-    const { contentSessionId, last_user_message, last_assistant_message } = req.body;
+    const { contentSessionId, last_assistant_message } = req.body;
 
     if (!contentSessionId) {
       return this.badRequest(res, 'Missing contentSessionId');
@@ -510,17 +518,7 @@ export class SessionRoutes extends BaseRouteHandler {
     }
 
     // Queue summarize
-    this.sessionManager.queueSummarize(
-      sessionDbId,
-      last_user_message || logger.happyPathError(
-        'SESSION',
-        'Missing last_user_message when queueing summary in SessionRoutes',
-        { sessionId: sessionDbId },
-        undefined,
-        ''
-      ),
-      last_assistant_message
-    );
+    this.sessionManager.queueSummarize(sessionDbId, last_assistant_message);
 
     // Ensure SDK agent is running
     this.ensureGeneratorRunning(sessionDbId, 'summarize');
@@ -562,20 +560,24 @@ export class SessionRoutes extends BaseRouteHandler {
     // Step 1: Create/get SDK session (idempotent INSERT OR IGNORE)
     const sessionDbId = store.createSDKSession(contentSessionId, project, prompt);
 
-    logger.info('HTTP', 'SessionRoutes: createSDKSession returned', {
-      sessionDbId,
-      contentSessionId
+    // Verify session creation with DB lookup
+    const dbSession = store.getSessionById(sessionDbId);
+    const isNewSession = !dbSession?.memory_session_id;
+    logger.info('SESSION', `CREATED | contentSessionId=${contentSessionId} → sessionDbId=${sessionDbId} | isNew=${isNewSession} | project=${project}`, {
+      sessionId: sessionDbId
     });
 
     // Step 2: Get next prompt number from user_prompts count
     const currentCount = store.getPromptNumberFromUserPrompts(contentSessionId);
     const promptNumber = currentCount + 1;
 
-    logger.info('HTTP', 'SessionRoutes: Calculated promptNumber', {
-      sessionDbId,
-      promptNumber,
-      currentCount
-    });
+    // Debug-level alignment logs for detailed tracing
+    const memorySessionId = dbSession?.memory_session_id || null;
+    if (promptNumber > 1) {
+      logger.debug('HTTP', `[ALIGNMENT] DB Lookup Proof | contentSessionId=${contentSessionId} → memorySessionId=${memorySessionId || '(not yet captured)'} | prompt#=${promptNumber}`);
+    } else {
+      logger.debug('HTTP', `[ALIGNMENT] New Session | contentSessionId=${contentSessionId} | prompt#=${promptNumber} | memorySessionId will be captured on first SDK response`);
+    }
 
     // Step 3: Strip privacy tags from prompt
     const cleanedPrompt = stripMemoryTagsFromPrompt(prompt);
@@ -600,10 +602,10 @@ export class SessionRoutes extends BaseRouteHandler {
     // Step 5: Save cleaned user prompt
     store.saveUserPrompt(contentSessionId, promptNumber, cleanedPrompt);
 
-    logger.info('SESSION', 'Session initialized via HTTP', {
+    // Debug-level log since CREATED already logged the key info
+    logger.debug('SESSION', 'User prompt saved', {
       sessionId: sessionDbId,
-      promptNumber,
-      project
+      promptNumber
     });
 
     res.json({

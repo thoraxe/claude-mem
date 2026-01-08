@@ -1,9 +1,15 @@
 import path from 'path';
 import { logger } from './logger.js';
+import { resolveProjectIdentity } from './git-project-identity.js';
 
 /**
  * Extract project name from working directory path
- * Handles edge cases: null/undefined cwd, drive roots, trailing slashes
+ *
+ * Uses git-aware identity cascade:
+ * 1. .claude-mem config file in repo root (explicit override)
+ * 2. Git remote origin URL (normalized)
+ * 3. Git repo root basename
+ * 4. Folder basename (fallback for non-git directories)
  *
  * @param cwd - Current working directory (absolute path)
  * @returns Project name or "unknown-project" if extraction fails
@@ -14,24 +20,32 @@ export function getProjectName(cwd: string | null | undefined): string {
     return 'unknown-project';
   }
 
-  // Extract basename (handles trailing slashes automatically)
+  return resolveProjectIdentity(cwd).name;
+}
+
+/**
+ * Get folder basename only (legacy behavior)
+ * Use this when git-aware identity is explicitly not wanted
+ *
+ * @param cwd - Current working directory (absolute path)
+ * @returns Folder basename or "unknown-project" if extraction fails
+ */
+export function getFolderBasename(cwd: string | null | undefined): string {
+  if (!cwd || cwd.trim() === '') {
+    return 'unknown-project';
+  }
+
   const basename = path.basename(cwd);
 
   // Edge case: Drive roots on Windows (C:\, J:\) or Unix root (/)
-  // path.basename('C:\') returns '' (empty string)
   if (basename === '') {
-    // Extract drive letter on Windows, or use 'root' on Unix
     const isWindows = process.platform === 'win32';
     if (isWindows) {
       const driveMatch = cwd.match(/^([A-Z]):\\/i);
       if (driveMatch) {
-        const driveLetter = driveMatch[1].toUpperCase();
-        const projectName = `drive-${driveLetter}`;
-        logger.info('PROJECT_NAME', 'Drive root detected', { cwd, projectName });
-        return projectName;
+        return `drive-${driveMatch[1].toUpperCase()}`;
       }
     }
-    logger.warn('PROJECT_NAME', 'Root directory detected, using fallback', { cwd });
     return 'unknown-project';
   }
 
